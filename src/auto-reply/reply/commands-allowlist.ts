@@ -208,6 +208,23 @@ function readPolicyValue(raw: unknown): string | undefined {
   return value || undefined;
 }
 
+function listNormalizedConfiguredAccountIds(accountsValue: unknown): string[] {
+  if (!accountsValue || typeof accountsValue !== "object") {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      Object.keys(accountsValue as Record<string, unknown>)
+        .map((key) => normalizeOptionalAccountId(key))
+        .filter((key): key is string => Boolean(key)),
+    ),
+  ).toSorted((a, b) => a.localeCompare(b));
+}
+
+function hasConfiguredAccountId(accountsValue: unknown, accountId: string): boolean {
+  return listNormalizedConfiguredAccountIds(accountsValue).includes(normalizeAccountId(accountId));
+}
+
 function resolveChannelAccountConfig(params: {
   cfg: OpenClawConfig;
   channelId: ChannelId;
@@ -234,17 +251,30 @@ function resolveChannelAccountConfig(params: {
   return accountValue as Record<string, unknown>;
 }
 
-function resolveFeishuFallbackAllowlistAccountId(accountsValue: unknown): string | undefined {
-  if (!accountsValue || typeof accountsValue !== "object") {
-    return undefined;
+function resolveMergedFeishuAllowlistConfig(params: {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+}): Record<string, unknown> | null {
+  const channels = params.cfg.channels as Record<string, unknown> | undefined;
+  const channelValue = channels?.feishu;
+  if (!channelValue || typeof channelValue !== "object") {
+    return null;
   }
-  const ids = Array.from(
-    new Set(
-      Object.keys(accountsValue as Record<string, unknown>)
-        .map((key) => normalizeOptionalAccountId(key))
-        .filter((key): key is string => Boolean(key)),
-    ),
-  ).toSorted((a, b) => a.localeCompare(b));
+  const channel = channelValue as Record<string, unknown>;
+  const account = resolveChannelAccountConfig({
+    cfg: params.cfg,
+    channelId: "feishu",
+    accountId: params.accountId,
+  });
+  const { accounts: _ignoredAccounts, defaultAccount: _ignoredDefaultAccount, ...base } = channel;
+  if (!account || account === channel) {
+    return base;
+  }
+  return { ...base, ...account };
+}
+
+function resolveFeishuFallbackAllowlistAccountId(accountsValue: unknown): string | undefined {
+  const ids = listNormalizedConfiguredAccountIds(accountsValue);
   if (ids.includes(DEFAULT_ACCOUNT_ID)) {
     return DEFAULT_ACCOUNT_ID;
   }
@@ -277,7 +307,10 @@ function resolveEffectiveAllowlistAccountId(params: {
   const rawDefaultAccount =
     typeof record.defaultAccount === "string" ? record.defaultAccount.trim() : "";
   if (hasAccounts && rawDefaultAccount) {
-    return normalizeAccountId(rawDefaultAccount);
+    const normalizedDefaultAccount = normalizeAccountId(rawDefaultAccount);
+    if (hasConfiguredAccountId(accountsValue, normalizedDefaultAccount)) {
+      return normalizedDefaultAccount;
+    }
   }
   if (params.channelId === "feishu" && hasAccounts) {
     const fallbackAccountId = resolveFeishuFallbackAllowlistAccountId(accountsValue);
@@ -404,21 +437,14 @@ function resolveChannelAllowFromPaths(
   return null;
 }
 
-function resolveAllowlistChannelId(params: {
-  raw?: string | null;
-  cfg: OpenClawConfig;
-}): ChannelId | null {
-  const normalized = normalizeChannelId(params.raw);
+function resolveAllowlistChannelId(raw?: string | null): ChannelId | null {
+  const normalized = normalizeChannelId(raw);
   if (normalized) {
     return normalized;
   }
-  const fallback = params.raw?.trim().toLowerCase();
+  const fallback = raw?.trim().toLowerCase();
   if (!fallback) {
     return null;
-  }
-  const channels = params.cfg.channels as Record<string, unknown> | undefined;
-  if (channels && Object.hasOwn(channels, fallback)) {
-    return fallback as ChannelId;
   }
   if (getChannelDock(fallback as ChannelId)) {
     return fallback as ChannelId;
@@ -483,10 +509,17 @@ export const handleAllowlistCommand: CommandHandler = async (params, allowTextCo
     return unauthorized;
   }
 
+  const requestedChannelId = resolveAllowlistChannelId(parsed.channel);
+  if (parsed.channel?.trim() && !requestedChannelId) {
+    return {
+      shouldContinue: false,
+      reply: { text: "⚠️ Unknown channel. Add channel=<id> to the command." },
+    };
+  }
   const channelId =
-    resolveAllowlistChannelId({ raw: parsed.channel, cfg: params.cfg }) ??
+    requestedChannelId ??
     params.command.channelId ??
-    resolveAllowlistChannelId({ raw: params.command.channel, cfg: params.cfg });
+    resolveAllowlistChannelId(params.command.channel);
   if (!channelId) {
     return {
       shouldContinue: false,
@@ -584,7 +617,7 @@ export const handleAllowlistCommand: CommandHandler = async (params, allowTextCo
         }
       }
     } else if (channelId === "feishu") {
-      const account = resolveChannelAccountConfig({ cfg: params.cfg, channelId, accountId });
+      const account = resolveMergedFeishuAllowlistConfig({ cfg: params.cfg, accountId });
       dmAllowFrom = readAllowlistEntries(account?.allowFrom);
       groupAllowFrom = readAllowlistEntries(account?.groupAllowFrom);
       dmPolicy = readPolicyValue(account?.dmPolicy);

@@ -54,6 +54,25 @@ vi.mock("../../pairing/pairing-store.js", async () => {
   };
 });
 
+vi.mock("../../channels/dock.js", async () => {
+  const actual =
+    await vi.importActual<typeof import("../../channels/dock.js")>("../../channels/dock.js");
+  return {
+    ...actual,
+    getChannelDock: (channelId: string) =>
+      actual.getChannelDock(channelId as never) ??
+      (channelId === "feishu"
+        ? ({
+            id: "feishu",
+            config: {
+              formatAllowFrom: ({ allowFrom }: { allowFrom: Array<string | number> }) =>
+                allowFrom.map((entry) => String(entry).trim()).filter(Boolean),
+            },
+          } as never)
+        : null),
+  };
+});
+
 vi.mock("../../channels/plugins/pairing.js", async () => {
   const actual = await vi.importActual<typeof import("../../channels/plugins/pairing.js")>(
     "../../channels/plugins/pairing.js",
@@ -840,6 +859,34 @@ describe("handleCommands /allowlist", () => {
     expect(result.reply?.text).not.toContain("user:default");
   });
 
+  it("falls back when feishu defaultAccount points to a missing account", async () => {
+    const cfg = {
+      commands: { text: true },
+      channels: {
+        feishu: {
+          defaultAccount: "missing",
+          accounts: {
+            ops: {
+              dmPolicy: "allowlist",
+              allowFrom: ["user:ops"],
+              groupPolicy: "allowlist",
+              groupAllowFrom: ["chat:ops"],
+            },
+          },
+        },
+      },
+    } as OpenClawConfig;
+    const params = buildPolicyParams("/allowlist list all channel=feishu", cfg, {
+      AccountId: undefined,
+    });
+    const result = await handleCommands(params);
+
+    expect(result.shouldContinue).toBe(false);
+    expect(result.reply?.text).toContain("Channel: feishu (account ops)");
+    expect(result.reply?.text).toContain("DM allowFrom (config): user:ops");
+    expect(result.reply?.text).not.toContain("account missing");
+  });
+
   it("writes to feishu defaultAccount for config edits when --account is omitted", async () => {
     readConfigFileSnapshotMock.mockResolvedValueOnce({
       valid: true,
@@ -898,6 +945,33 @@ describe("handleCommands /allowlist", () => {
     expect(result.reply?.text).toContain("channels.feishu.accounts.ops.allowFrom");
   });
 
+  it("lists merged feishu account config when account inherits top-level allowlist", async () => {
+    const cfg = {
+      commands: { text: true },
+      channels: {
+        feishu: {
+          dmPolicy: "allowlist",
+          allowFrom: ["user:owner"],
+          groupPolicy: "allowlist",
+          groupAllowFrom: ["chat:shared"],
+          accounts: {
+            ops: {
+              groupAllowFrom: ["chat:ops"],
+            },
+          },
+        },
+      },
+    } as OpenClawConfig;
+    const params = buildPolicyParams("/allowlist list all channel=feishu --account ops", cfg);
+    const result = await handleCommands(params);
+
+    expect(result.shouldContinue).toBe(false);
+    expect(result.reply?.text).toContain("Channel: feishu (account ops)");
+    expect(result.reply?.text).toContain("DM policy: allowlist");
+    expect(result.reply?.text).toContain("DM allowFrom (config): user:owner");
+    expect(result.reply?.text).toContain("Group allowFrom (config): chat:ops");
+  });
+
   it("falls back to first feishu account when defaultAccount is unset", async () => {
     const cfg = {
       commands: { text: true },
@@ -954,6 +1028,22 @@ describe("handleCommands /allowlist", () => {
     expect(result.reply?.text).toContain("Config writes are disabled for feishu");
     expect(readConfigFileSnapshotMock).not.toHaveBeenCalled();
     expect(writeConfigFileMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects unknown channel ids instead of accepting typoed config keys", async () => {
+    const cfg = {
+      commands: { text: true },
+      channels: {
+        feishuu: {
+          allowFrom: ["user:typo"],
+        },
+      },
+    } as OpenClawConfig;
+    const params = buildPolicyParams("/allowlist list dm channel=feishuu", cfg);
+    const result = await handleCommands(params);
+
+    expect(result.shouldContinue).toBe(false);
+    expect(result.reply?.text).toContain("Unknown channel");
   });
 
   it("rejects blocked account ids and keeps Object.prototype clean", async () => {
